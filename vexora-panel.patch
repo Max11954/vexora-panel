@@ -1,0 +1,1127 @@
+diff --git a/.github/workflows/vexora-release.yml b/.github/workflows/vexora-release.yml
+new file mode 100644
+index 0000000..c4baae1
+--- /dev/null
++++ b/.github/workflows/vexora-release.yml
+@@ -0,0 +1,52 @@
++name: Vexora release
++
++# Every push to main becomes a GitHub release. The panel's update check and
++# `vexora-update` follow the latest release, so pushing is all you need to do.
++on:
++  push:
++    branches: [main]
++    paths-ignore:
++      - "**.md"
++
++permissions:
++  contents: write
++
++concurrency:
++  group: vexora-release
++  cancel-in-progress: false
++
++jobs:
++  release:
++    # Do not loop on our own version-bump commit.
++    if: "!contains(github.event.head_commit.message, '[skip release]')"
++    runs-on: ubuntu-latest
++    steps:
++      - uses: actions/checkout@v4
++        with:
++          fetch-depth: 0
++
++      - name: Compute next version (last release + 1, 4th component)
++        id: ver
++        run: |
++          current=$(sed -n "s/.*define('APP_VERSION', 'v\([0-9.]*\)').*/\1/p" backend/boot/constants.php)
++          last=$(git tag --list 'v[0-9]*' --sort=-v:refname | head -n1 | sed 's/^v//')
++          base="${last:-$current}"
++          IFS=. read -r a b c d <<<"$base"
++          next="${a:-1}.${b:-0}.${c:-0}.$(( ${d:-0} + 1 ))"
++          echo "version=$next" >> "$GITHUB_OUTPUT"
++
++      - name: Write version, commit, tag
++        run: |
++          v='${{ steps.ver.outputs.version }}'
++          sed -i "s/define('APP_VERSION', '[^']*')/define('APP_VERSION', 'v${v}')/" backend/boot/constants.php
++          git config user.name "github-actions[bot]"
++          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
++          git add backend/boot/constants.php
++          git commit -m "chore: release v${v} [skip release]"
++          git tag "v${v}"
++          git push origin HEAD:main --follow-tags
++
++      - name: Create GitHub release
++        env:
++          GH_TOKEN: ${{ github.token }}
++        run: gh release create "v${{ steps.ver.outputs.version }}" --generate-notes --title "v${{ steps.ver.outputs.version }}"
+diff --git a/backend/app/Controllers/Admin/DashboardController.php b/backend/app/Controllers/Admin/DashboardController.php
+index 9dd91a0..4b029b1 100644
+--- a/backend/app/Controllers/Admin/DashboardController.php
++++ b/backend/app/Controllers/Admin/DashboardController.php
+@@ -728,6 +728,65 @@ class DashboardController
+         return null;
+     }
+ 
++    /**
++     * Map the latest GitHub release of "owner/repo" to the update-server "latest" shape.
++     * Everything else the upstream update server offers (project metadata, release lists,
++     * per-version lookups) does not exist for a fork, so those paths return null.
++     *
++     * @return array<string, mixed>|null
++     */
++    private function fetchGithubLatestRelease(string $repo, string $path): ?array
++    {
++        if ($path !== '/' . self::UPDATE_PROJECT_SLUG . '/latest') {
++            return null;
++        }
++        if (preg_match('#^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$#', $repo) !== 1) {
++            return null;
++        }
++
++        $logger = App::getInstance(true)->getLogger();
++        $context = stream_context_create([
++            'http' => [
++                'timeout' => 10,
++                'user_agent' => 'Panel/' . (defined('APP_VERSION') ? APP_VERSION : 'unknown'),
++                'header' => "Accept: application/vnd.github+json\r\n",
++                'ignore_errors' => true,
++            ],
++        ]);
++        $response = @file_get_contents('https://api.github.com/repos/' . $repo . '/releases/latest', false, $context);
++        if ($response === false) {
++            $logger->warning('Failed to fetch latest GitHub release for ' . $repo);
++
++            return null;
++        }
++        $release = json_decode($response, true);
++        $tag = is_array($release) ? trim((string) ($release['tag_name'] ?? '')) : '';
++        if ($tag === '') {
++            return null;
++        }
++
++        $body = (string) ($release['body'] ?? '');
++        $name = trim((string) ($release['name'] ?? ''));
++
++        return [
++            'version' => ltrim($tag, 'vV'),
++            'type' => 'stable',
++            'release_name' => $name !== '' ? $name : $tag,
++            'release_description' => $body,
++            'description' => $body,
++            'min_supported_php' => null,
++            'max_supported_php' => null,
++            'is_security_release' => false,
++            'github_html_url' => $release['html_url'] ?? null,
++            'published_at' => $release['published_at'] ?? null,
++            'changelog_added' => [],
++            'changelog_fixed' => [],
++            'changelog_improved' => [],
++            'changelog_updated' => [],
++            'changelog_removed' => [],
++        ];
++    }
++
+     /**
+      * GET JSON from the MythicalSystems Update Server.
+      *
+@@ -736,6 +795,12 @@ class DashboardController
+     private function fetchUpdateServerJson(string $path): ?array
+     {
+         $logger = App::getInstance(true)->getLogger();
++
++        // Forks: serve the "latest release" lookup from the fork's GitHub releases.
++        $githubRepo = trim((string) App::env('UPDATE_GITHUB_REPO', ''));
++        if ($githubRepo !== '') {
++            return $this->fetchGithubLatestRelease($githubRepo, $path);
++        }
+         $url = self::UPDATE_SERVER_BASE . $path;
+         $userAgent = 'FeatherPanel/' . (defined('APP_VERSION') ? APP_VERSION : 'unknown');
+ 
+diff --git a/backend/app/Controllers/Admin/SettingsController.php b/backend/app/Controllers/Admin/SettingsController.php
+index 4ada06d..fedc1cb 100755
+--- a/backend/app/Controllers/Admin/SettingsController.php
++++ b/backend/app/Controllers/Admin/SettingsController.php
+@@ -5440,6 +5440,10 @@ class SettingsController
+     public function triggerDockerUpdate(Request $request): Response
+     {
+         if (!$this->isDockerDeployment()) {
++            if ($this->isSourceUpdateEnabled()) {
++                return $this->triggerSourceUpdate($request);
++            }
++
+             return ApiResponse::error(
+                 'Docker updates are available only for Docker deployments.',
+                 'DOCKER_DEPLOYMENT_REQUIRED',
+@@ -5593,6 +5597,59 @@ class SettingsController
+         return $codes;
+     }
+ 
++    private function isSourceUpdateEnabled(): bool
++    {
++        $flag = strtolower(trim((string) App::env('PANEL_SOURCE_UPDATE', 'false')));
++
++        return in_array($flag, ['1', 'true', 'yes', 'on'], true);
++    }
++
++    /**
++     * Source (non-Docker) installs: start the root-owned systemd oneshot that runs `vexora-update`.
++     * The web user may only run exactly this one command via sudo (see /etc/sudoers.d/vexora-panel-update).
++     */
++    private function triggerSourceUpdate(Request $request): Response
++    {
++        $user = $request->attributes->get('user');
++        $pipes = [];
++        $process = @proc_open(
++            ['sudo', '-n', '/usr/bin/systemctl', 'start', '--no-block', 'vexora-panel-update.service'],
++            [1 => ['pipe', 'w'], 2 => ['pipe', 'w']],
++            $pipes,
++        );
++        if (!is_resource($process)) {
++            return ApiResponse::error('Could not start the panel updater.', 'SOURCE_UPDATE_START_FAILED', 500);
++        }
++        $stderr = isset($pipes[2]) ? trim((string) stream_get_contents($pipes[2])) : '';
++        foreach ($pipes as $pipe) {
++            fclose($pipe);
++        }
++        $exitCode = proc_close($process);
++
++        if ($exitCode !== 0) {
++            $this->app->getLogger()->error('Source panel update failed to start: ' . $stderr);
++
++            return ApiResponse::error(
++                'The panel updater is not set up on this server. Run "vexora-update --setup" as root once.',
++                'SOURCE_UPDATE_NOT_CONFIGURED',
++                500,
++            );
++        }
++
++        Activity::createActivity([
++            'user_uuid' => $user['uuid'] ?? null,
++            'name' => 'trigger_source_panel_update',
++            'context' => 'Triggered source panel update from admin settings',
++            'ip_address' => CloudFlareRealIP::getRealIP(),
++        ]);
++
++        return ApiResponse::success(
++            ['updater' => 'systemd:vexora-panel-update.service'],
++            'Panel update started. The panel will be unavailable for a few minutes.',
++            200,
++        );
++    }
++
+     private function isDockerDeployment(): bool
+     {
+         $flag = strtolower(trim((string) App::env('PANEL_DOCKER_DEPLOYMENT', 'false')));
+diff --git a/backend/app/Controllers/Admin/VmInstancesController.php b/backend/app/Controllers/Admin/VmInstancesController.php
+index bbe3376..dfbeb65 100644
+--- a/backend/app/Controllers/Admin/VmInstancesController.php
++++ b/backend/app/Controllers/Admin/VmInstancesController.php
+@@ -900,7 +900,7 @@ class VmInstancesController
+                         'is_primary' => $index === 0,
+                         'sort_order' => $index,
+                         'ip' => $ipRow['ip'] ?? null,
+-                        'cidr' => isset($ipRow['cidr']) ? (int) $ipRow['cidr'] : 24,
++                        'cidr' => isset($ipRow['cidr']) ? (int) $ipRow['cidr'] : VmInstanceUtil::defaultCidr($ipRow['ip'] ?? null),
+                         'gateway' => $ipRow['gateway'] ?? null,
+                     ];
+                 }
+@@ -937,7 +937,7 @@ class VmInstancesController
+                     $dbUpdate['cpus'] = $cores;
+                 }
+                 if ($ip) {
+-                    $cidr = isset($ip['cidr']) && $ip['cidr'] !== null ? (int) $ip['cidr'] : 24;
++                    $cidr = isset($ip['cidr']) && $ip['cidr'] !== null ? (int) $ip['cidr'] : null;
+                     $gateway = trim((string) ($ip['gateway'] ?? ''));
+                     $bridge = 'vmbr0';
+                     $curCfg = $client->getVmConfig($node, (int) $instance['vmid'], 'lxc');
+@@ -946,12 +946,7 @@ class VmInstancesController
+                             $bridge = $m[1];
+                         }
+                     }
+-                    $ipStr = str_replace([',', '='], '', (string) $ip['ip']);
+-                    $net0 = 'name=eth0,bridge=' . $bridge . ',ip=' . $ipStr . '/' . $cidr;
+-                    if ($gateway !== '') {
+-                        $net0 .= ',gw=' . str_replace([',', '='], '', $gateway);
+-                    }
+-                    $config['net0'] = $net0;
++                    $config['net0'] = 'name=eth0,bridge=' . $bridge . ',' . VmInstanceUtil::formatIpFragment((string) $ip['ip'], $cidr, $gateway);
+                 }
+             } elseif ($vmType === 'qemu' && $networks === null) {
+                 if ($cpus !== null) {
+@@ -963,13 +958,9 @@ class VmInstancesController
+                     $dbUpdate['cores'] = $cores;
+                 }
+                 if ($ip) {
+-                    $cidr = isset($ip['cidr']) && $ip['cidr'] !== null ? (int) $ip['cidr'] : 24;
+-                    $gateway = $ip['gateway'] ?? '';
+-                    $ipconfig0 = 'ip=' . $ip['ip'] . '/' . $cidr;
+-                    if ($gateway !== '') {
+-                        $ipconfig0 .= ',gw=' . $gateway;
+-                    }
+-                    $config['ipconfig0'] = $ipconfig0;
++                    $cidr = isset($ip['cidr']) && $ip['cidr'] !== null ? (int) $ip['cidr'] : null;
++                    $gateway = (string) ($ip['gateway'] ?? '');
++                    $config['ipconfig0'] = VmInstanceUtil::formatIpFragment((string) $ip['ip'], $cidr, $gateway);
+                 }
+ 
+                 // BIOS mode: seabios or ovmf
+diff --git a/backend/app/Controllers/User/NodeStatusController.php b/backend/app/Controllers/User/NodeStatusController.php
+index 53537a1..59d02e6 100755
+--- a/backend/app/Controllers/User/NodeStatusController.php
++++ b/backend/app/Controllers/User/NodeStatusController.php
+@@ -84,8 +84,8 @@ class NodeStatusController
+             'show_player_count' => $showPlayerCount,
+             'powered_by' => [
+                 'show' => $showPoweredBy,
+-                'label' => 'FeatherPanel',
+-                'url' => 'https://featherpanel.com',
++                'label' => 'Vexora-Cloud-Hosting',
++                'url' => 'https://panel.vexora-cloud.de',
+             ],
+         ];
+ 
+diff --git a/backend/app/Services/Vm/VmInstanceUtil.php b/backend/app/Services/Vm/VmInstanceUtil.php
+index 679ae90..220f941 100644
+--- a/backend/app/Services/Vm/VmInstanceUtil.php
++++ b/backend/app/Services/Vm/VmInstanceUtil.php
+@@ -164,12 +164,50 @@ final class VmInstanceUtil
+                 'is_primary' => true,
+                 'sort_order' => 0,
+                 'ip' => $ip['ip'] ?? ($instance['ip_address'] ?? null),
+-                'cidr' => isset($ip['cidr']) ? (int) $ip['cidr'] : 24,
++                'cidr' => isset($ip['cidr']) ? (int) $ip['cidr'] : self::defaultCidr($ip['ip'] ?? ($instance['ip_address'] ?? null)),
+                 'gateway' => $ip['gateway'] ?? ($instance['gateway'] ?? null),
+             ],
+         ];
+     }
+ 
++    /**
++     * True when the given pool address is IPv6.
++     */
++    public static function isIpv6(string $ip): bool
++    {
++        return str_contains($ip, ':');
++    }
++
++    /**
++     * Default prefix length when a pool row has none: /64 for IPv6, /24 for IPv4.
++     */
++    public static function defaultCidr(?string $ip): int
++    {
++        return $ip !== null && self::isIpv6($ip) ? 64 : 24;
++    }
++
++    /**
++     * Build the Proxmox ip/gw fragment for an address.
++     *
++     * IPv4 => "ip=1.2.3.4/24,gw=1.2.3.1", IPv6 => "ip6=2001:db8::2/64,gw6=2001:db8::1".
++     * A missing/invalid prefix falls back to /24 (IPv4) or /64 (IPv6).
++     */
++    public static function formatIpFragment(string $ip, ?int $cidr, ?string $gateway = null): string
++    {
++        $ip = str_replace([',', '=', ' '], '', trim($ip));
++        $v6 = self::isIpv6($ip);
++        if ($cidr === null || $cidr < 1 || $cidr > ($v6 ? 128 : 32)) {
++            $cidr = $v6 ? 64 : 24;
++        }
++        $fragment = ($v6 ? 'ip6=' : 'ip=') . $ip . '/' . $cidr;
++        $gateway = $gateway !== null ? str_replace([',', '=', ' '], '', trim($gateway)) : '';
++        if ($gateway !== '') {
++            $fragment .= ($v6 ? ',gw6=' : ',gw=') . $gateway;
++        }
++
++        return $fragment;
++    }
++
+     /**
+      * @param array<int, array<string, mixed>> $assignments
+      * @param array<string, mixed> $currentConfig
+@@ -199,7 +237,7 @@ final class VmInstanceUtil
+             $normalized[] = [
+                 'network_key' => $networkKey,
+                 'ip' => trim($ip),
+-                'cidr' => isset($assignment['cidr']) ? (int) $assignment['cidr'] : 24,
++                'cidr' => isset($assignment['cidr']) ? (int) $assignment['cidr'] : self::defaultCidr(trim($ip)),
+                 'gateway' => isset($assignment['gateway']) && is_string($assignment['gateway']) ? trim($assignment['gateway']) : '',
+                 'bridge' => isset($assignment['bridge']) && is_string($assignment['bridge']) ? trim($assignment['bridge']) : '',
+                 'interface_name' => isset($assignment['interface_name']) && is_string($assignment['interface_name']) ? trim($assignment['interface_name']) : '',
+@@ -219,6 +257,8 @@ final class VmInstanceUtil
+             }));
+             $desiredNetKeys = [];
+             $desiredIpconfigKeys = [];
++            $v4GatewayUsed = false;
++            $v6GatewayUsed = false;
+ 
+             foreach ($normalized as $index => $assignment) {
+                 $networkKey = $assignment['network_key'];
+@@ -241,11 +281,24 @@ final class VmInstanceUtil
+                     $config[$networkKey] = 'virtio,bridge=' . $bridge;
+                 }
+ 
+-                $ipconfig = 'ip=' . $assignment['ip'] . '/' . max(1, $assignment['cidr']);
+-                if ($index === 0 && $assignment['gateway'] !== '') {
+-                    $ipconfig .= ',gw=' . $assignment['gateway'];
++                // Default gateway: first IPv4 NIC gets gw=, first IPv6 NIC gets gw6=
++                // (so a v4 NIC + a v6 NIC gives a working dual-stack VM).
++                $isV6 = self::isIpv6((string) $assignment['ip']);
++                $useGateway = false;
++                if ($assignment['gateway'] !== '') {
++                    if ($isV6 && !$v6GatewayUsed) {
++                        $useGateway = true;
++                        $v6GatewayUsed = true;
++                    } elseif (!$isV6 && !$v4GatewayUsed) {
++                        $useGateway = true;
++                        $v4GatewayUsed = true;
++                    }
+                 }
+-                $config['ipconfig' . $networkIndex] = $ipconfig;
++                $config['ipconfig' . $networkIndex] = self::formatIpFragment(
++                    (string) $assignment['ip'],
++                    (int) $assignment['cidr'],
++                    $useGateway ? (string) $assignment['gateway'] : null
++                );
+             }
+ 
+             foreach ($currentNetKeys as $key) {
+@@ -263,6 +316,8 @@ final class VmInstanceUtil
+                 return preg_match('/^net\d+$/', (string) $key);
+             }));
+             $desiredNetKeys = [];
++            $lxcV4GatewayUsed = false;
++            $lxcV6GatewayUsed = false;
+ 
+             foreach ($normalized as $index => $assignment) {
+                 $networkKey = $assignment['network_key'];
+@@ -270,10 +325,22 @@ final class VmInstanceUtil
+ 
+                 $bridge = $assignment['bridge'] !== '' ? $assignment['bridge'] : 'vmbr0';
+                 $interfaceName = $assignment['interface_name'] !== '' ? $assignment['interface_name'] : ('eth' . $index);
+-                $net = 'name=' . $interfaceName . ',bridge=' . $bridge . ',ip=' . $assignment['ip'] . '/' . max(1, $assignment['cidr']);
+-                if ($index === 0 && $assignment['gateway'] !== '') {
+-                    $net .= ',gw=' . $assignment['gateway'];
++                $isV6 = self::isIpv6((string) $assignment['ip']);
++                $useGateway = false;
++                if ($assignment['gateway'] !== '') {
++                    if ($isV6 && !$lxcV6GatewayUsed) {
++                        $useGateway = true;
++                        $lxcV6GatewayUsed = true;
++                    } elseif (!$isV6 && !$lxcV4GatewayUsed) {
++                        $useGateway = true;
++                        $lxcV4GatewayUsed = true;
++                    }
+                 }
++                $net = 'name=' . $interfaceName . ',bridge=' . $bridge . ',' . self::formatIpFragment(
++                    (string) $assignment['ip'],
++                    (int) $assignment['cidr'],
++                    $useGateway ? (string) $assignment['gateway'] : null
++                );
+                 $config[$networkKey] = $net;
+             }
+ 
+@@ -506,7 +573,7 @@ final class VmInstanceUtil
+             'ci_user' => $ciUser,
+             'ci_password' => $ciPassword,
+             'ip_address' => $ip['ip'] ?? ($instance['ip_address'] ?? null),
+-            'ip_cidr' => $ip ? (int) ($ip['cidr'] ?? 24) : 24,
++            'ip_cidr' => $ip ? (int) ($ip['cidr'] ?? self::defaultCidr($ip['ip'] ?? null)) : 24,
+             'gateway' => $ip['gateway'] ?? ($instance['gateway'] ?? null),
+             'memory' => $savedMemory,
+             'cpus' => $savedCpus,
+@@ -1215,7 +1282,7 @@ final class VmInstanceUtil
+                 'is_primary' => false,
+                 'sort_order' => $index,
+                 'ip' => $ipRow['ip'] ?? null,
+-                'cidr' => isset($ipRow['cidr']) ? (int) $ipRow['cidr'] : 24,
++                'cidr' => isset($ipRow['cidr']) ? (int) $ipRow['cidr'] : self::defaultCidr($ipRow['ip'] ?? null),
+                 'gateway' => $ipRow['gateway'] ?? null,
+             ];
+         }
+@@ -1234,7 +1301,7 @@ final class VmInstanceUtil
+                 'is_primary' => true,
+                 'sort_order' => 0,
+                 'ip' => $ip['ip'] ?? null,
+-                'cidr' => isset($ip['cidr']) ? (int) $ip['cidr'] : 24,
++                'cidr' => isset($ip['cidr']) ? (int) $ip['cidr'] : self::defaultCidr($ip['ip'] ?? null),
+                 'gateway' => $ip['gateway'] ?? null,
+             ];
+         } else {
+diff --git a/backend/storage/modules/pma/auth-page.php b/backend/storage/modules/pma/auth-page.php
+index 9a43534..8a06b67 100644
+--- a/backend/storage/modules/pma/auth-page.php
++++ b/backend/storage/modules/pma/auth-page.php
+@@ -223,7 +223,7 @@ $pmaPostLoadScript = $pmaPostLoadScript ?? '';
+             </div>
+ 
+             <div id="powered-by-footer" class="footer">
+-                <span id="powered-by-prefix"></span><a id="powered-by-link" href="https://featherpanel.com" target="_blank" rel="noopener noreferrer"><span id="powered-by-name">FeatherPanel</span></a>
++                <span id="powered-by-prefix"></span><a id="powered-by-link" href="https://panel.vexora-cloud.de" target="_blank" rel="noopener noreferrer"><span id="powered-by-name">Vexora-Cloud-Hosting</span></a>
+             </div>
+         </div>
+     </div>
+diff --git a/backend/storage/modules/pma/loading-page.php b/backend/storage/modules/pma/loading-page.php
+index 9a43534..8a06b67 100644
+--- a/backend/storage/modules/pma/loading-page.php
++++ b/backend/storage/modules/pma/loading-page.php
+@@ -223,7 +223,7 @@ $pmaPostLoadScript = $pmaPostLoadScript ?? '';
+             </div>
+ 
+             <div id="powered-by-footer" class="footer">
+-                <span id="powered-by-prefix"></span><a id="powered-by-link" href="https://featherpanel.com" target="_blank" rel="noopener noreferrer"><span id="powered-by-name">FeatherPanel</span></a>
++                <span id="powered-by-prefix"></span><a id="powered-by-link" href="https://panel.vexora-cloud.de" target="_blank" rel="noopener noreferrer"><span id="powered-by-name">Vexora-Cloud-Hosting</span></a>
+             </div>
+         </div>
+     </div>
+diff --git a/frontendv2/public/locales/en.json b/frontendv2/public/locales/en.json
+index b185e56..714164e 100644
+--- a/frontendv2/public/locales/en.json
++++ b/frontendv2/public/locales/en.json
+@@ -1943,7 +1943,7 @@
+     "branding": {
+         "running_on": "Running on {name} {version}",
+         "copyright": "{company}",
+-        "powered_by": "Powered by FeatherPanel"
++        "powered_by": "Powered by Vexora-Cloud-Hosting"
+     },
+     "links": {
+         "aria_label": "Panel links",
+@@ -4474,7 +4474,7 @@
+         "copyEmail": "Copy email",
+         "showEmail": "Show email",
+         "hideEmail": "Hide email",
+-        "poweredBy": "powered by featherpanel",
++        "poweredBy": "powered by vexora-cloud-hosting",
+         "localStorageMenu": "Browser storage",
+         "localStorageDefaultAppName": "Hosting panel",
+         "localStorageTitle": "{appName} browser storage",
+@@ -8530,9 +8530,9 @@
+                 },
+                 "errors": {
+                     "ip_required": "An IP address is required.",
+-                    "ip_invalid": "Please enter a valid IPv4 address.",
+-                    "cidr_invalid": "CIDR prefix length must be between 0 and 32.",
+-                    "gateway_invalid": "Please enter a valid gateway IPv4 address."
++                    "ip_invalid": "Please enter a valid IPv4 or IPv6 address.",
++                    "cidr_invalid": "CIDR prefix length must be between 0 and 32 (IPv4) or 0 and 128 (IPv6).",
++                    "gateway_invalid": "Please enter a valid gateway IPv4 or IPv6 address."
+                 },
+                 "help": {
+                     "what_are_ips": "What is the IP Pool?",
+@@ -12409,15 +12409,15 @@
+                 }
+             },
+             "docker_update": {
+-                "button": "Update Docker Deployment",
++                "button": "Update Panel",
+                 "in_progress_button": "System Update Ongoing",
+-                "updating": "Updating Docker Deployment...",
++                "updating": "Updating Panel...",
+                 "confirm": "This will pull the latest FeatherPanel Docker images and recreate containers. Continue?",
+-                "success": "Docker update has been triggered successfully.",
+-                "failed": "Failed to trigger Docker update.",
++                "success": "Panel update has been started.",
++                "failed": "Failed to start the panel update.",
+                 "confirm_modal": {
+                     "title": "Update FeatherPanel",
+-                    "description": "This will pull the latest FeatherPanel Docker images and recreate containers. Do you want to continue?",
++                    "description": "This will update the panel to the latest release. The panel will be unavailable for a few minutes. Do you want to continue?",
+                     "confirm": "Update to Latest",
+                     "cancel": "Cancel"
+                 },
+diff --git a/frontendv2/src/app/(app)/admin/vds-nodes/[id]/edit/IpPoolTab.tsx b/frontendv2/src/app/(app)/admin/vds-nodes/[id]/edit/IpPoolTab.tsx
+index 8f314a0..b94be3e 100644
+--- a/frontendv2/src/app/(app)/admin/vds-nodes/[id]/edit/IpPoolTab.tsx
++++ b/frontendv2/src/app/(app)/admin/vds-nodes/[id]/edit/IpPoolTab.tsx
+@@ -15,6 +15,7 @@ See the LICENSE file or <https://www.gnu.org/licenses/>.
+ 
+ 'use client';
+ 
++import { isValidIp, maxCidrFor } from '@/lib/ip-validation';
+ import { useState, useEffect, useCallback } from 'react';
+ import axios from 'axios';
+ import { useTranslation } from '@/contexts/TranslationContext';
+@@ -190,12 +191,12 @@ export function IpPoolTab({ nodeId, nodeName }: IpPoolTabProps) {
+ 
+     const validateCreate = () => {
+         const errs: Record<string, string> = {};
+-        const ipRegex = /^(\d{1,3}\.){3}\d{1,3}$/;
++        const ipRegex = { test: isValidIp };
+         if (!createForm.ip) errs.ip = t('admin.vdsNodes.ips.errors.ip_required');
+         else if (!ipRegex.test(createForm.ip)) errs.ip = t('admin.vdsNodes.ips.errors.ip_invalid');
+         if (createForm.cidr !== '') {
+             const cidr = parseInt(createForm.cidr, 10);
+-            if (isNaN(cidr) || cidr < 0 || cidr > 32) errs.cidr = t('admin.vdsNodes.ips.errors.cidr_invalid');
++            if (isNaN(cidr) || cidr < 0 || cidr > maxCidrFor(createForm.ip)) errs.cidr = t('admin.vdsNodes.ips.errors.cidr_invalid');
+         }
+         if (createForm.gateway && !ipRegex.test(createForm.gateway))
+             errs.gateway = t('admin.vdsNodes.ips.errors.gateway_invalid');
+@@ -230,7 +231,7 @@ export function IpPoolTab({ nodeId, nodeName }: IpPoolTabProps) {
+     };
+ 
+     const handleCreateBulk = async () => {
+-        const ipRegex = /^(\d{1,3}\.){3}\d{1,3}$/;
++        const ipRegex = { test: isValidIp };
+         const entries = Array.from(
+             new Set(
+                 bulkIpsInput
+@@ -250,7 +251,7 @@ export function IpPoolTab({ nodeId, nodeName }: IpPoolTabProps) {
+         }
+         if (createForm.cidr !== '') {
+             const cidr = parseInt(createForm.cidr, 10);
+-            if (isNaN(cidr) || cidr < 0 || cidr > 32) {
++            if (isNaN(cidr) || cidr < 0 || entries.some((ip) => cidr > maxCidrFor(ip))) {
+                 toast.error(t('admin.vdsNodes.ips.errors.cidr_invalid'));
+                 return;
+             }
+@@ -309,10 +310,10 @@ export function IpPoolTab({ nodeId, nodeName }: IpPoolTabProps) {
+     const handleEdit = async () => {
+         if (!editIp) return;
+         const errs: Record<string, string> = {};
+-        const ipRegex = /^(\d{1,3}\.){3}\d{1,3}$/;
++        const ipRegex = { test: isValidIp };
+         if (editForm.cidr !== '') {
+             const cidr = parseInt(editForm.cidr, 10);
+-            if (isNaN(cidr) || cidr < 0 || cidr > 32) errs.cidr = t('admin.vdsNodes.ips.errors.cidr_invalid');
++            if (isNaN(cidr) || cidr < 0 || cidr > maxCidrFor(editIp.ip)) errs.cidr = t('admin.vdsNodes.ips.errors.cidr_invalid');
+         }
+         if (editForm.gateway && !ipRegex.test(editForm.gateway))
+             errs.gateway = t('admin.vdsNodes.ips.errors.gateway_invalid');
+diff --git a/frontendv2/src/components/admin/VmIpPickerSheet.tsx b/frontendv2/src/components/admin/VmIpPickerSheet.tsx
+index 68b18f6..e59582d 100644
+--- a/frontendv2/src/components/admin/VmIpPickerSheet.tsx
++++ b/frontendv2/src/components/admin/VmIpPickerSheet.tsx
+@@ -15,6 +15,7 @@ See the LICENSE file or <https://www.gnu.org/licenses/>.
+ 
+ 'use client';
+ 
++import { isValidIp, maxCidrFor } from '@/lib/ip-validation';
+ import { useEffect, useMemo, useState } from 'react';
+ import axios from 'axios';
+ import { useTranslation } from '@/contexts/TranslationContext';
+@@ -87,12 +88,12 @@ export function VmIpPickerSheet({
+ 
+     const validateCreate = () => {
+         const errs: Record<string, string> = {};
+-        const ipRegex = /^(\d{1,3}\.){3}\d{1,3}$/;
++        const ipRegex = { test: isValidIp };
+         if (!createForm.ip) errs.ip = t('admin.vdsNodes.ips.errors.ip_required');
+         else if (!ipRegex.test(createForm.ip)) errs.ip = t('admin.vdsNodes.ips.errors.ip_invalid');
+         if (createForm.cidr !== '') {
+             const cidr = parseInt(createForm.cidr, 10);
+-            if (isNaN(cidr) || cidr < 0 || cidr > 32) errs.cidr = t('admin.vdsNodes.ips.errors.cidr_invalid');
++            if (isNaN(cidr) || cidr < 0 || cidr > maxCidrFor(createForm.ip)) errs.cidr = t('admin.vdsNodes.ips.errors.cidr_invalid');
+         }
+         if (createForm.gateway && !ipRegex.test(createForm.gateway))
+             errs.gateway = t('admin.vdsNodes.ips.errors.gateway_invalid');
+@@ -141,7 +142,7 @@ export function VmIpPickerSheet({
+     };
+ 
+     const handleCreateBulk = async () => {
+-        const ipRegex = /^(\d{1,3}\.){3}\d{1,3}$/;
++        const ipRegex = { test: isValidIp };
+         const entries = parseBulkIps(bulkIpsInput);
+         if (entries.length === 0) {
+             toast.error(t('admin.vdsNodes.ips.bulk_empty'));
+@@ -154,7 +155,7 @@ export function VmIpPickerSheet({
+         }
+         if (createForm.cidr !== '') {
+             const cidr = parseInt(createForm.cidr, 10);
+-            if (isNaN(cidr) || cidr < 0 || cidr > 32) {
++            if (isNaN(cidr) || cidr < 0 || entries.some((ip) => cidr > maxCidrFor(ip))) {
+                 toast.error(t('admin.vdsNodes.ips.errors.cidr_invalid'));
+                 return;
+             }
+diff --git a/frontendv2/src/lib/branding.ts b/frontendv2/src/lib/branding.ts
+index 7fca891..c6609cc 100644
+--- a/frontendv2/src/lib/branding.ts
++++ b/frontendv2/src/lib/branding.ts
+@@ -15,7 +15,7 @@ See the LICENSE file or <https://www.gnu.org/licenses/>.
+ 
+ import type { AppSettings } from '@/types/settings';
+ 
+-export const FEATHERPANEL_MARKETING_URL = 'https://featherpanel.com';
++export const FEATHERPANEL_MARKETING_URL = 'https://panel.vexora-cloud.de';
+ 
+ export function shouldShowPoweredBy(
+     settings: Pick<AppSettings, 'branding_show_powered_by'> | null | undefined,
+diff --git a/frontendv2/src/lib/ip-validation.ts b/frontendv2/src/lib/ip-validation.ts
+new file mode 100644
+index 0000000..a5b4573
+--- /dev/null
++++ b/frontendv2/src/lib/ip-validation.ts
+@@ -0,0 +1,66 @@
++/*
++This file is part of FeatherPanel.
++
++Copyright (C) 2025 MythicalSystems Studios
++Copyright (C) 2025 FeatherPanel Contributors
++Copyright (C) 2025 Cassian Gherman (aka NaysKutzu)
++
++This program is free software: you can redistribute it and/or modify
++it under the terms of the GNU Affero General Public License as published
++by the Free Software Foundation, either version 3 of the License, or
++(at your option) any later version.
++
++See the LICENSE file or <https://www.gnu.org/licenses/>.
++*/
++
++const IPV4_REGEX = /^((25[0-5]|2[0-4]\d|1?\d{1,2})\.){3}(25[0-5]|2[0-4]\d|1?\d{1,2})$/;
++
++/** True for a plain IPv6 address (full or compressed, no brackets, no prefix length). */
++export function isValidIpv6(value: string): boolean {
++    const ip = value.trim();
++    if (!ip.includes(':') || !/^[0-9a-f:.]+$/i.test(ip)) {
++        return false;
++    }
++    // At most one "::" and no ":::".
++    if (ip.includes(':::') || ip.split('::').length > 2) {
++        return false;
++    }
++    // A single leading/trailing colon is only valid as part of "::".
++    if ((ip.startsWith(':') && !ip.startsWith('::')) || (ip.endsWith(':') && !ip.endsWith('::'))) {
++        return false;
++    }
++
++    let head = ip;
++    const groupsAllowed = 8;
++    // Optional embedded IPv4 tail (::ffff:1.2.3.4) counts as two groups.
++    const lastColon = ip.lastIndexOf(':');
++    const tail = ip.slice(lastColon + 1);
++    if (tail.includes('.')) {
++        if (!IPV4_REGEX.test(tail)) {
++            return false;
++        }
++        head = ip.slice(0, lastColon + 1) + '0:0';
++    }
++
++    const compressed = head.includes('::');
++    const groups = head.split(':').filter((g, i, arr) => !(g === '' && (i === 0 || i === arr.length - 1 || compressed)));
++    if (groups.some((g) => !/^[0-9a-f]{1,4}$/i.test(g))) {
++        return false;
++    }
++
++    return compressed ? groups.length < groupsAllowed : groups.length === groupsAllowed;
++}
++
++export function isValidIpv4(value: string): boolean {
++    return IPV4_REGEX.test(value.trim());
++}
++
++/** True for an IPv4 or IPv6 address. */
++export function isValidIp(value: string): boolean {
++    return isValidIpv4(value) || isValidIpv6(value);
++}
++
++/** Largest valid prefix length for the address family of `ip` (32 for IPv4, 128 for IPv6). */
++export function maxCidrFor(ip: string): number {
++    return ip.includes(':') ? 128 : 32;
++}
+diff --git a/frontendv2/src/lib/pma-auth-context.ts b/frontendv2/src/lib/pma-auth-context.ts
+index 431f97d..fdacd5d 100644
+--- a/frontendv2/src/lib/pma-auth-context.ts
++++ b/frontendv2/src/lib/pma-auth-context.ts
+@@ -92,7 +92,7 @@ export function preparePmaAuthContext(
+             loggingOutMessage: t('serverDatabases.pmaAuth.loggingOutMessage'),
+             authError: t('serverDatabases.pmaAuth.authError'),
+             poweredBy: t('serverDatabases.pmaAuth.poweredBy', {
+-                name: settings?.app_name?.trim() || 'Panel',
++                name: 'Vexora-Cloud-Hosting',
+             }),
+             loading: t('serverDatabases.pmaAuth.loading'),
+         },
+diff --git a/install.sh b/install.sh
+new file mode 100755
+index 0000000..228f95f
+--- /dev/null
++++ b/install.sh
+@@ -0,0 +1,49 @@
++#!/usr/bin/env bash
++# One-command installer (source install, Debian/Ubuntu):
++#
++#   curl -fsSL https://raw.githubusercontent.com/OWNER/REPO/main/install.sh | sudo bash
++#
++set -euo pipefail
++
++FP_REPO_SLUG="${FP_REPO_SLUG:-OWNER/REPO}"
++RAW="https://raw.githubusercontent.com/${FP_REPO_SLUG}/refs/heads/main"
++
++[ "$(id -u)" -eq 0 ] || { echo "Please run as root:  curl -fsSL ${RAW}/install.sh | sudo bash" >&2; exit 1; }
++command -v apt-get >/dev/null 2>&1 || { echo "This installer needs Debian or Ubuntu (apt-get)." >&2; exit 1; }
++[ -r /etc/os-release ] || { echo "Cannot detect the OS (/etc/os-release missing)." >&2; exit 1; }
++# shellcheck disable=SC1091
++. /etc/os-release
++
++# Minimum versions the underlying installer supports: Debian 11+, Ubuntu 22.04+.
++case "${ID:-}" in
++    debian) min="11" ;;
++    ubuntu) min="22.04" ;;
++    *) echo "Unsupported OS '${ID:-unknown}'. Supported: Debian 11+ and Ubuntu 22.04+." >&2; exit 1 ;;
++esac
++if [ -n "${VERSION_ID:-}" ] && dpkg --compare-versions "$VERSION_ID" lt "$min"; then
++    echo "${PRETTY_NAME:-$ID $VERSION_ID} is too old (need ${ID} ${min} or newer)." >&2
++    exit 1
++fi
++
++export DEBIAN_FRONTEND=noninteractive
++apt-get update -y >/dev/null
++apt-get install -y curl git ca-certificates >/dev/null
++
++tmp="$(mktemp -d)"
++trap 'rm -rf "$tmp"' EXIT
++curl -fsSL "${RAW}/installer/install.bash" -o "${tmp}/install.bash"
++curl -fsSL "${RAW}/installer/vexora/vexora-update" -o /usr/local/bin/vexora-update
++chmod +x /usr/local/bin/vexora-update "${tmp}/install.bash"
++printf 'FP_REPO_SLUG=%s\n' "$FP_REPO_SLUG" >/etc/vexora-panel.conf
++
++export FP_REPO_SLUG FP_PANEL_MODE=source
++if [ -r /dev/tty ]; then
++    bash "${tmp}/install.bash" "$@" </dev/tty
++else
++    bash "${tmp}/install.bash" "$@"
++fi
++
++# Activate the in-panel updater and the `vexora-update` command.
++/usr/local/bin/vexora-update --setup || echo "Note: updater setup skipped (panel not installed yet?)."
++echo
++echo "Done. Update later with:  sudo vexora-update   (or use the update button in the admin panel)"
+diff --git a/installer/install.bash b/installer/install.bash
+index 95c28b3..f41cf30 100755
+--- a/installer/install.bash
++++ b/installer/install.bash
+@@ -1,4 +1,8 @@
+ #!/bin/bash
++
++# Repo this installer pulls sources/sub-scripts/releases from (owner/name).
++FP_REPO_SLUG="${FP_REPO_SLUG:-OWNER/REPO}"
++export FP_REPO_SLUG
+ # FeatherPanel/FeatherWings Docker Installation Script
+ # Docker-only installer/uninstaller for Ubuntu/Debian
+ 
+@@ -1515,7 +1519,7 @@ get_source_scripts_branch() {
+ 
+ get_latest_panel_release_tag() {
+ 	local latest_tag=""
+-	latest_tag=$(curl -fsSL "https://api.github.com/repos/MythicalLTD/FeatherPanel/releases/latest" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1 || true)
++	latest_tag=$(curl -fsSL "https://api.github.com/repos/${FP_REPO_SLUG}/releases/latest" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1 || true)
+ 	echo "$latest_tag"
+ }
+ 
+@@ -1593,7 +1597,7 @@ run_source_subscript_from_github() {
+ 	local tmp_script
+ 
+ 	branch="$(get_source_scripts_branch)"
+-	script_url="https://raw.githubusercontent.com/MythicalLTD/FeatherPanel/refs/heads/${branch}/installer/source/init/${subscript}.bash"
++	script_url="https://raw.githubusercontent.com/${FP_REPO_SLUG}/refs/heads/${branch}/installer/source/init/${subscript}.bash"
+ 	tmp_script="/tmp/featherpanel-source-${subscript}.bash"
+ 
+ 	log_info "Fetching source ${subscript} script from GitHub (${branch})"
+@@ -1624,7 +1628,7 @@ run_source_prereq_script_from_github() {
+ 	local tmp_script
+ 
+ 	branch="$(get_source_scripts_branch)"
+-	script_url="https://raw.githubusercontent.com/MythicalLTD/FeatherPanel/refs/heads/${branch}/installer/source/${script_name}.bash"
++	script_url="https://raw.githubusercontent.com/${FP_REPO_SLUG}/refs/heads/${branch}/installer/source/${script_name}.bash"
+ 	tmp_script="/tmp/featherpanel-source-${script_name}.bash"
+ 
+ 	log_info "Fetching source prereq script from GitHub (${branch}): ${script_name}.bash"
+diff --git a/installer/source/init/panel.bash b/installer/source/init/panel.bash
+index 962177e..0a70de6 100644
+--- a/installer/source/init/panel.bash
++++ b/installer/source/init/panel.bash
+@@ -8,9 +8,10 @@ APT_RETRY_COUNT="${APT_RETRY_COUNT:-5}"
+ APT_RETRY_DELAY="${APT_RETRY_DELAY:-5}"
+ 
+ PANEL_DIR="${PANEL_DIR:-/var/www/featherpanel}"
+-PANEL_REPO="${PANEL_REPO:-https://github.com/mythicalltd/featherpanel.git}"
++FP_REPO_SLUG="${FP_REPO_SLUG:-OWNER/REPO}"
++PANEL_REPO="${PANEL_REPO:-https://github.com/${FP_REPO_SLUG}.git}"
+ PANEL_GIT_REF_TYPE="${PANEL_GIT_REF_TYPE:-branch}"
+-PANEL_GIT_REF="${PANEL_GIT_REF:-develop}"
++PANEL_GIT_REF="${PANEL_GIT_REF:-main}"
+ BACKEND_DIR="${BACKEND_DIR:-${PANEL_DIR}/backend}"
+ FRONTEND_DIR="${FRONTEND_DIR:-${PANEL_DIR}/frontendv2}"
+ FRONTEND_MODE="${FRONTEND_MODE:-build}"
+diff --git a/installer/source/init/update.bash b/installer/source/init/update.bash
+index d853aeb..0c469bf 100755
+--- a/installer/source/init/update.bash
++++ b/installer/source/init/update.bash
+@@ -4,7 +4,7 @@ set -euo pipefail
+ 
+ PANEL_DIR="${PANEL_DIR:-/var/www/featherpanel}"
+ PANEL_GIT_REF_TYPE="${PANEL_GIT_REF_TYPE:-branch}"
+-PANEL_GIT_REF="${PANEL_GIT_REF:-develop}"
++PANEL_GIT_REF="${PANEL_GIT_REF:-main}"
+ BACKEND_DIR="${BACKEND_DIR:-${PANEL_DIR}/backend}"
+ FRONTEND_DIR="${FRONTEND_DIR:-${PANEL_DIR}/frontendv2}"
+ RUNNER_DIR="${RUNNER_DIR:-${PANEL_DIR}/runner}"
+diff --git a/installer/vexora/vexora-update b/installer/vexora/vexora-update
+new file mode 100755
+index 0000000..51123c3
+--- /dev/null
++++ b/installer/vexora/vexora-update
+@@ -0,0 +1,109 @@
++#!/usr/bin/env bash
++# vexora-update — update (or set up the updater for) a source-installed panel.
++#
++#   vexora-update            update to the latest GitHub release
++#   vexora-update --setup    (re)install updater unit, sudoers rule and .env flags only
++#
++# Installed to /usr/local/bin/vexora-update by install.sh. Needs root.
++set -euo pipefail
++
++CONF_FILE="/etc/vexora-panel.conf"
++# shellcheck disable=SC1090
++[ -f "$CONF_FILE" ] && . "$CONF_FILE"
++FP_REPO_SLUG="${FP_REPO_SLUG:-OWNER/REPO}"
++PANEL_DIR="${PANEL_DIR:-/var/www/featherpanel}"
++ENV_FILE="${PANEL_DIR}/backend/storage/config/.env"
++UNIT_FILE="/etc/systemd/system/vexora-panel-update.service"
++SUDOERS_FILE="/etc/sudoers.d/vexora-panel-update"
++SETUP_ONLY=0
++
++for arg in "$@"; do
++    case "$arg" in
++        --setup) SETUP_ONLY=1 ;;
++        --non-interactive) ;;
++        -h | --help) sed -n 2,8p "$0"; exit 0 ;;
++    esac
++done
++
++[ "$(id -u)" -eq 0 ] || { echo "Please run as root (sudo vexora-update)." >&2; exit 1; }
++
++upsert_env() {
++    local key="$1" value="$2"
++    [ -f "$ENV_FILE" ] || return 0
++    if grep -q "^${key}=" "$ENV_FILE"; then
++        sed -i "s|^${key}=.*|${key}=${value}|" "$ENV_FILE"
++    else
++        printf '%s=%s\n' "$key" "$value" >>"$ENV_FILE"
++    fi
++}
++
++setup_updater() {
++    printf 'FP_REPO_SLUG=%s\nPANEL_DIR=%s\n' "$FP_REPO_SLUG" "$PANEL_DIR" >"$CONF_FILE"
++    chmod 644 "$CONF_FILE"
++
++    cat >"$UNIT_FILE" <<UNIT
++[Unit]
++Description=Panel updater (vexora-update)
++After=network-online.target
++Wants=network-online.target
++
++[Service]
++Type=oneshot
++ExecStart=/usr/local/bin/vexora-update --non-interactive
++TimeoutStartSec=3600
++UNIT
++
++    # The web user (www-data) may start exactly this one unit, nothing else.
++    local tmp
++    tmp="$(mktemp)"
++    echo 'www-data ALL=(root) NOPASSWD: /usr/bin/systemctl start --no-block vexora-panel-update.service' >"$tmp"
++    if command -v visudo >/dev/null 2>&1 && ! visudo -cf "$tmp" >/dev/null; then
++        rm -f "$tmp"
++        echo "sudoers rule failed validation; not installing it." >&2
++        return 1
++    fi
++    install -m 0440 "$tmp" "$SUDOERS_FILE"
++    rm -f "$tmp"
++
++    systemctl daemon-reload
++
++    # Flags the panel reads: update check against our releases + enable the in-panel button.
++    upsert_env UPDATE_GITHUB_REPO "$FP_REPO_SLUG"
++    upsert_env PANEL_SOURCE_UPDATE "true"
++    echo "Updater set up for ${FP_REPO_SLUG}."
++}
++
++latest_release_tag() {
++    curl -fsSL "https://api.github.com/repos/${FP_REPO_SLUG}/releases/latest" \
++        | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1 || true
++}
++
++run_update() {
++    exec 9>/run/vexora-update.lock
++    flock -n 9 || { echo "An update is already running." >&2; exit 1; }
++
++    local tag ref_type ref script
++    tag="$(latest_release_tag)"
++    if [ -n "$tag" ]; then ref_type="tag"; ref="$tag"; else ref_type="branch"; ref="main"; fi
++    echo "Updating ${FP_REPO_SLUG} to ${ref_type} ${ref} ..."
++
++    # Run the newest update script from the repo (falls back to the local copy).
++    script="$(mktemp)"
++    if ! curl -fsSL "https://raw.githubusercontent.com/${FP_REPO_SLUG}/${ref}/installer/source/init/update.bash" -o "$script"; then
++        cp "${PANEL_DIR}/installer/source/init/update.bash" "$script"
++    fi
++    chmod +x "$script"
++
++    setup_updater   # flags must be in .env before the update restarts the backend
++    FP_REPO_SLUG="$FP_REPO_SLUG" PANEL_DIR="$PANEL_DIR" \
++        PANEL_GIT_REF_TYPE="$ref_type" PANEL_GIT_REF="$ref" \
++        bash "$script" 2>&1 | tee -a /var/log/vexora-update.log
++    rm -f "$script"
++    echo "Update finished."
++}
++
++if [ "$SETUP_ONLY" -eq 1 ]; then
++    setup_updater
++else
++    run_update
++fi
+diff --git a/runner/src/processor/cidr.rs b/runner/src/processor/cidr.rs
+index 97a3f01..d0e1685 100644
+--- a/runner/src/processor/cidr.rs
++++ b/runner/src/processor/cidr.rs
+@@ -11,16 +11,53 @@ pub fn normalize_cidr(raw: Option<i32>) -> i32 {
+     }
+ }
+ 
++/// True when the pool address is IPv6 (contains a colon, e.g. `2001:db8::2`).
++pub fn is_ipv6(ip: &str) -> bool {
++    ip.contains(':')
++}
++
++/// Like [`normalize_cidr`] but aware of the address family.
++///
++/// IPv4 keeps the old behaviour (fallback `/24`). IPv6 pools without a usable
++/// prefix fall back to `/64`, because a `/24` IPv6 prefix is never what an
++/// operator means and Proxmox/cloud-init would configure a broken network.
++pub fn normalize_cidr_for_ip(ip: &str, raw: Option<i32>) -> i32 {
++    if is_ipv6(ip) {
++        match raw {
++            Some(v) if (1..=128).contains(&v) => v,
++            _ => 64,
++        }
++    } else {
++        normalize_cidr(raw)
++    }
++}
++
+ /// Read `featherpanel_vm_ips.cidr` off a MySQL row.
+ ///
+ /// The column is `tinyint UNSIGNED`. sqlx will not decode that as `i32`, so
+ /// `try_get::<i32>("cidr").unwrap_or(24)` always fell back to `/24` even when
+ /// the pool row stored `27`. Try the types sqlx actually produces, and treat
+ /// NULL as "use the /24 default".
++#[allow(dead_code)]
+ pub fn cidr_from_mysql_row(row: &sqlx::mysql::MySqlRow) -> i32 {
+     normalize_cidr(decode_optional_int(row, "cidr"))
+ }
+ 
++/// Same as [`cidr_from_mysql_row`] but with the correct default for IPv6 pools.
++pub fn cidr_from_mysql_row_for_ip(row: &sqlx::mysql::MySqlRow, ip: &str) -> i32 {
++    normalize_cidr_for_ip(ip, decode_optional_int(row, "cidr"))
++}
++
++/// Same as [`cidr_from_json`] but with the correct default for IPv6 addresses.
++pub fn cidr_from_json_for_ip(value: &serde_json::Value, ip: &str) -> i32 {
++    let raw = value
++        .as_i64()
++        .map(|v| v as i32)
++        .or_else(|| value.as_u64().map(|v| v as i32))
++        .or_else(|| value.as_str().and_then(|s| s.parse::<i32>().ok()));
++    normalize_cidr_for_ip(ip, raw)
++}
++
+ /// Prefer a JSON number, but also accept a numeric string from older task meta.
+ pub fn cidr_from_json(value: &serde_json::Value) -> i32 {
+     let raw = value
+@@ -31,23 +68,35 @@ pub fn cidr_from_json(value: &serde_json::Value) -> i32 {
+     normalize_cidr(raw)
+ }
+ 
++/// Cloud-init `ipconfigN` value. IPv4 -> `ip=`/`gw=`, IPv6 -> `ip6=`/`gw6=`.
+ pub fn format_qemu_ipconfig(ip: &str, cidr: i32, gateway: &str) -> String {
+-    let cidr = normalize_cidr(Some(cidr));
++    let cidr = normalize_cidr_for_ip(ip, Some(cidr));
++    let (ip_key, gw_key) = if is_ipv6(ip) {
++        ("ip6", "gw6")
++    } else {
++        ("ip", "gw")
++    };
+     if gateway.is_empty() {
+-        format!("ip={}/{}", ip, cidr)
++        format!("{}={}/{}", ip_key, ip, cidr)
+     } else {
+-        format!("ip={}/{},gw={}", ip, cidr, gateway)
++        format!("{}={}/{},{}={}", ip_key, ip, cidr, gw_key, gateway)
+     }
+ }
+ 
++/// LXC `netN` value. IPv4 -> `ip=`/`gw=`, IPv6 -> `ip6=`/`gw6=`.
+ pub fn format_lxc_net(bridge: &str, ip: &str, cidr: i32, gateway: &str) -> String {
+-    let cidr = normalize_cidr(Some(cidr));
++    let cidr = normalize_cidr_for_ip(ip, Some(cidr));
++    let (ip_key, gw_key) = if is_ipv6(ip) {
++        ("ip6", "gw6")
++    } else {
++        ("ip", "gw")
++    };
+     if gateway.is_empty() {
+-        format!("name=eth0,bridge={},ip={}/{}", bridge, ip, cidr)
++        format!("name=eth0,bridge={},{}={}/{}", bridge, ip_key, ip, cidr)
+     } else {
+         format!(
+-            "name=eth0,bridge={},ip={}/{},gw={}",
+-            bridge, ip, cidr, gateway
++            "name=eth0,bridge={},{}={}/{},{}={}",
++            bridge, ip_key, ip, cidr, gw_key, gateway
+         )
+     }
+ }
+@@ -112,6 +161,31 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn ipv6_uses_ip6_and_gw6() {
++        assert_eq!(
++            format_qemu_ipconfig("2001:db8::2", 64, "2001:db8::1"),
++            "ip6=2001:db8::2/64,gw6=2001:db8::1"
++        );
++        assert_eq!(
++            format_qemu_ipconfig("2001:db8::2", 56, ""),
++            "ip6=2001:db8::2/56"
++        );
++        assert_eq!(
++            format_lxc_net("vmbr0", "2001:db8::2", 64, "2001:db8::1"),
++            "name=eth0,bridge=vmbr0,ip6=2001:db8::2/64,gw6=2001:db8::1"
++        );
++    }
++
++    #[test]
++    fn ipv6_defaults_to_64_not_24() {
++        assert_eq!(normalize_cidr_for_ip("2001:db8::2", None), 64);
++        assert_eq!(normalize_cidr_for_ip("2001:db8::2", Some(0)), 64);
++        assert_eq!(normalize_cidr_for_ip("2001:db8::2", Some(48)), 48);
++        assert_eq!(normalize_cidr_for_ip("203.0.113.2", None), 24);
++        assert_eq!(cidr_from_json_for_ip(&json!(null), "2001:db8::2"), 64);
++    }
++
+     #[test]
+     fn json_meta_accepts_number_or_string() {
+         assert_eq!(cidr_from_json(&json!(27)), 27);
+diff --git a/runner/src/processor/create.rs b/runner/src/processor/create.rs
+index 39451b0..148ffbf 100644
+--- a/runner/src/processor/create.rs
++++ b/runner/src/processor/create.rs
+@@ -390,7 +390,7 @@ async fn apply_create_config(
+     
+     let ip_row = ip_row.ok_or_else(|| anyhow::anyhow!("IP not found"))?;
+     let ip: String = ip_row.try_get("ip")?;
+-    let cidr: i32 = cidr::cidr_from_mysql_row(&ip_row);
++    let cidr: i32 = cidr::cidr_from_mysql_row_for_ip(&ip_row, &ip);
+     let gateway: String = ip_row.try_get("gateway").unwrap_or_default();
+     let assignment_mode: String = ip_row
+         .try_get("assignment_mode")
+@@ -814,7 +814,7 @@ async fn apply_reinstall_config(
+     let hostname = meta["hostname"].as_str().unwrap_or(&default_hostname);
+     
+     let ip_address = meta["ip_address"].as_str().unwrap_or("");
+-    let ip_cidr = cidr::cidr_from_json(&meta["ip_cidr"]);
++    let ip_cidr = cidr::cidr_from_json_for_ip(&meta["ip_cidr"], ip_address);
+     let gateway = meta["gateway"].as_str().unwrap_or("");
+     let memory = meta["memory"].as_i64().unwrap_or(512);
+     let cpus = meta["cpus"].as_i64().unwrap_or(1);
